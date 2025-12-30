@@ -1,0 +1,401 @@
+name: Terraform Azure AKS Deployment
+
+on:
+  push:
+    branches:
+      - main
+      - feature/*
+    paths:
+      - 'infra/**/*.tf'
+      - 'pipeline/.github/workflows/terraform.yml'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Select action to run'
+        required: true
+        type: choice
+        options:
+          - all
+          - validate
+          - plan
+          - apply
+          - verify
+          - destroy
+        default: 'all'
+      force_unlock:
+        description: 'Force unlock state (use lock ID from error)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: '1.5.0'
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+jobs:
+  terraform-validate:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/environments/dev
+    if: |
+      github.event_name != 'workflow_dispatch' || 
+      github.event.inputs.action == 'all' || 
+      github.event.inputs.action == 'validate' ||
+      github.event.inputs.action == 'plan' ||
+      github.event.inputs.action == 'apply' ||
+      github.event.inputs.action == 'verify'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        # with:
+        #   terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  prepare-storage:
+    name: Prepare Storage Account
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/environments/dev
+    needs: terraform-validate
+    if: |
+      always() &&
+      (needs.terraform-validate.result == 'success' || needs.terraform-validate.result == 'skipped') &&
+      (github.event_name != 'workflow_dispatch' || 
+       github.event.inputs.action == 'all' || 
+       github.event.inputs.action == 'plan' ||
+       github.event.inputs.action == 'apply' ||
+       github.event.inputs.action == 'verify')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform (without wrapper)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=aks-assignment.tfstate"
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Enable Storage Account Public Access (if exists)
+        continue-on-error: true
+        run: |
+          echo "Checking if storage account exists and enabling public access for Terraform operations..."
+          
+          STORAGE_ACCOUNT=$(terraform output -raw storage_account_name 2>/dev/null || echo "")
+          RESOURCE_GROUP=$(terraform output -raw resource_group_name 2>/dev/null || echo "")
+          
+          if [ -n "$STORAGE_ACCOUNT" ] && [ -n "$RESOURCE_GROUP" ]; then
+            echo "Storage Account: $STORAGE_ACCOUNT"
+            echo "Resource Group: $RESOURCE_GROUP"
+            
+            # Check if storage account exists
+            if az storage account show --name $STORAGE_ACCOUNT --resource-group $RESOURCE_GROUP &>/dev/null; then
+              echo "Storage account found. Checking current access settings..."
+              
+              CURRENT_PUBLIC_ACCESS=$(az storage account show \
+                --name $STORAGE_ACCOUNT \
+                --resource-group $RESOURCE_GROUP \
+                --query "publicNetworkAccess" -o tsv)
+              
+              echo "Current public network access: $CURRENT_PUBLIC_ACCESS"
+              
+              if [ "$CURRENT_PUBLIC_ACCESS" != "Enabled" ]; then
+                echo "Enabling public network access for Terraform operations..."
+                az storage account update \
+                  --name $STORAGE_ACCOUNT \
+                  --resource-group $RESOURCE_GROUP \
+                  --public-network-access Enabled \
+                  --default-action Allow
+                
+                echo "✓ Public access enabled for Terraform plan/apply operations"
+                
+                # Wait for the change to propagate
+                sleep 10
+              else
+                echo "Public access is already enabled. No changes needed."
+              fi
+            else
+              echo "Storage account does not exist yet. Will be created during apply. Skipping..."
+            fi
+          else
+            echo "Could not retrieve storage account details from state. This is expected for first-time deployment. Continuing..."
+          fi
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/environments/dev
+    needs: prepare-storage
+    if: |
+      always() &&
+      (needs.prepare-storage.result == 'success' || needs.prepare-storage.result == 'skipped') &&
+      (github.event_name != 'workflow_dispatch' || 
+       github.event.inputs.action == 'all' || 
+       github.event.inputs.action == 'plan' ||
+       github.event.inputs.action == 'apply' ||
+       github.event.inputs.action == 'verify')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+        
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=aks-assignment.tfstate"
+
+      - name: Force Unlock State (if requested)
+        if: github.event.inputs.force_unlock != ''
+        run: terraform force-unlock -force ${{ github.event.inputs.force_unlock }}
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan -var-file="terraform.tfvars"
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: infra/environments/dev/tfplan
+          retention-days: 5
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/environments/dev
+    needs: terraform-plan
+    if: |
+      always() &&
+      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped') &&
+      ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+       (github.event_name == 'workflow_dispatch' && 
+        (github.event.inputs.action == 'all' || 
+         github.event.inputs.action == 'apply' ||
+         github.event.inputs.action == 'verify')))
+    environment:
+      name: production
+      url: https://portal.azure.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: infra/environments/dev
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=aks-assignment.tfstate"
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Azure Login for Post-Deployment
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Terraform Init for Outputs
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=aks-assignment.tfstate"
+
+      - name: Setup Terraform (without wrapper)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Secure Storage Account - Disable Public Access
+        uses: ./pipeline/.github/actions/manage-storage-access
+        with:
+          action: disable
+          retrieve_from_state: 'true'
+
+  verify-deployment:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/environments/dev
+    needs: terraform-apply
+    if: |
+      always() &&
+      (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
+      (github.event_name != 'workflow_dispatch' || 
+       github.event.inputs.action == 'all' || 
+       github.event.inputs.action == 'verify')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=aks-assignment.tfstate"
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install kubelogin
+        run: |
+          # Download and install kubelogin
+          curl -LO https://github.com/Azure/kubelogin/releases/download/v0.1.3/kubelogin-linux-amd64.zip
+          unzip kubelogin-linux-amd64.zip
+          sudo mv bin/linux_amd64/kubelogin /usr/local/bin/
+          sudo chmod +x /usr/local/bin/kubelogin
+          kubelogin --version
+
+      - name: Get AKS Credentials
+        run: |
+          echo "Verifying AKS cluster deployment..."
+          az aks list --resource-group rg-aks-assignment --output table
+          
+          echo "Getting AKS credentials..."
+          az aks get-credentials --resource-group rg-aks-assignment --name aks-cluster --overwrite-existing
+          
+          echo "Converting kubeconfig to use Azure CLI authentication..."
+          kubelogin convert-kubeconfig -l azurecli
+          
+          echo "Checking cluster nodes..."
+          kubectl get nodes
+
+      - name: Verify CSI Drivers
+        continue-on-error: true
+        run: |
+          chmod +x ./tests/verify-csi-drivers.sh
+          ./tests/verify-csi-drivers.sh
+
+      - name: Verify Private Endpoint
+        continue-on-error: true
+        run: |
+          chmod +x ./tests/verify-private-endpoint.sh
+          STORAGE_ACCOUNT=$(terraform output -raw storage_account_name)
+          PRIVATE_IP=$(terraform output -raw private_endpoint_ip)
+          RESOURCE_GROUP=$(terraform output -raw resource_group_name)
+          ./tests/verify-private-endpoint.sh $STORAGE_ACCOUNT $PRIVATE_IP $RESOURCE_GROUP
+
+      - name: Test PVC with CSI Driver
+        continue-on-error: true
+        run: |
+          chmod +x ./tests/test-pvc-csi.sh
+          STORAGE_ACCOUNT=$(terraform output -raw storage_account_name)
+          # Run non-interactively by providing 'n' for cleanup prompt
+          echo "n" | ./tests/test-pvc-csi.sh $STORAGE_ACCOUNT
+
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/environments/dev
+    if: |
+      github.event_name == 'workflow_dispatch' && 
+      github.event.inputs.action == 'destroy'
+    environment:
+      name: production
+      url: https://portal.azure.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform (without wrapper)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.BACKEND_CONTAINER_NAME }}" \
+            -backend-config="key=aks-assignment.tfstate"
+
+      - name: Azure Login for Pre-Destroy
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+      - name: Re-enable Storage Account Public Access for Destruction
+        continue-on-error: true
+        uses: ./pipeline/.github/actions/manage-storage-access
+        with:
+          action: enable
+          retrieve_from_state: 'true'
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve -var-file="terraform.tfvars"

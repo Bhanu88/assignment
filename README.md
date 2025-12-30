@@ -1,32 +1,44 @@
-# Take Home Assignment
+# Azure AKS with CSI Storage - Complete Solution
 
-## Task: 
+## Overview
 
-Given a simplified spec, write Terraform code to: 
+This repository provides a production-ready Terraform solution for deploying Azure Kubernetes Service (AKS) with:
 
-- Deploy an AKS cluster with CSI storage integration. 
-- Set up a private endpoint for a storage account. 
-- Configure RBAC and policies for least privilege access. 
-- Provide a pipeline example 
+- **CSI Storage Integration** - All Azure storage drivers (Blob, Disk, File)
+- **Private Endpoint Security** - Zero public access to storage
+- **RBAC Configuration** - Least privilege access control
+- **Automated CI/CD** - GitHub Actions with security automation
+- **Modular Architecture** - Reusable components and test scripts
+- **Security Best Practices** - Automated public access management
 
+## Quick Links
 
-## Evaluation: 
-- Code quality and modularization. 
-- Use of variables, outputs, and state management. 
-- CI/CD awareness (describe how this would be integrated). 
-- Ability to explain and troubleshoot the code. 
+- [Complete Solution Documentation](SOLUTION.md)
+- [Azure AD Group Setup](AD-GROUP-SETUP.md)
+- [Testing Guide](infra/environments/dev/tests/README.md)
+- [Storage Examples](infra/environments/dev/examples/README.md)
+- [GitHub Actions Workflow](.github/workflows/terraform.yml)
+- [pipelines Documentation](pipelines/README.md)
 
+## Key Features
 
-## Requirements:
+### Security Automation
+- **Automated Public Access Control**: Storage account public access is automatically managed:
+  - Temporarily enabled before Terraform plan/apply
+  - Automatically disabled after deployment for private-only access
+  - Re-enabled before destruction to allow cleanup
+- **Private Endpoint Only**: All storage access routed through private endpoints
+- **Zero Trust Architecture**: No public internet access to storage resources
 
-We have provided a basic structure that can be changed as you wish.
-- AKS: Deploy an AKS cluster. Ensure the CSI driver is enabled.
-- Connectivity: Create a Private Endpoint so AKS can reach the storage securely.
-- CI/CD: Provide a .yaml file showing how you would automate the plan and apply stages.
+### Modular Design
+- **Reusable Actions**: Custom GitHub Actions for common operations
+- **Test Scripts**: Independent verification scripts in `/tests` folder
+- **Terraform Modules**: Organized by resource type (AKS, Storage, Networking, RBAC)
 
-## How to submit:
+### CI/CD pipelines
+- **GitHub Actions Workflow**: Complete automation with:
+  - Validation → Prepare Storage → Plan → Apply → Verify → Destroy
+  - Conditional execution (skip plan/apply when destroying)
+  - Automated security hardening
+  - Comprehensive verification tests
 
-- Extract the zip file and setup as your repo
-- Create a new branch feature/solution.
-- Open a Pull Request back to your own main branch.
-- Send us the link to the PR.

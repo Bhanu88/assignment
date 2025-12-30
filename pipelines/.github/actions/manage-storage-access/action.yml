@@ -1,0 +1,105 @@
+name: 'Manage Storage Account Public Access'
+description: 'Enable or disable public access on Azure Storage Account for Terraform operations'
+inputs:
+  action:
+    description: 'Action to perform: enable or disable'
+    required: true
+  storage_account_name:
+    description: 'Storage account name (optional if retrieving from Terraform state)'
+    required: false
+    default: ''
+  resource_group_name:
+    description: 'Resource group name (optional if retrieving from Terraform state)'
+    required: false
+    default: ''
+  retrieve_from_state:
+    description: 'Whether to retrieve names from Terraform state'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Manage Storage Account Access
+      shell: bash
+      run: |
+        ACTION="${{ inputs.action }}"
+        RETRIEVE_FROM_STATE="${{ inputs.retrieve_from_state }}"
+        
+        # Get storage account details
+        if [ "$RETRIEVE_FROM_STATE" == "true" ]; then
+          echo "Retrieving storage account details from Terraform state..."
+          STORAGE_ACCOUNT=$(terraform output -raw storage_account_name 2>/dev/null || echo "")
+          RESOURCE_GROUP=$(terraform output -raw resource_group_name 2>/dev/null || echo "")
+        else
+          STORAGE_ACCOUNT="${{ inputs.storage_account_name }}"
+          RESOURCE_GROUP="${{ inputs.resource_group_name }}"
+        fi
+        
+        if [ -z "$STORAGE_ACCOUNT" ] || [ -z "$RESOURCE_GROUP" ]; then
+          echo "Could not retrieve storage account details. This is expected for first-time deployment or if already destroyed. Skipping..."
+          exit 0
+        fi
+        
+        echo "Storage Account: $STORAGE_ACCOUNT"
+        echo "Resource Group: $RESOURCE_GROUP"
+        
+        # Check if storage account exists
+        if ! az storage account show --name $STORAGE_ACCOUNT --resource-group $RESOURCE_GROUP &>/dev/null; then
+          echo "Storage account does not exist. Skipping..."
+          exit 0
+        fi
+        
+        if [ "$ACTION" == "enable" ]; then
+          echo "Checking current access settings..."
+          CURRENT_PUBLIC_ACCESS=$(az storage account show \
+            --name $STORAGE_ACCOUNT \
+            --resource-group $RESOURCE_GROUP \
+            --query "publicNetworkAccess" -o tsv)
+          
+          echo "Current public network access: $CURRENT_PUBLIC_ACCESS"
+          
+          if [ "$CURRENT_PUBLIC_ACCESS" != "Enabled" ]; then
+            echo "Enabling public network access for Terraform operations..."
+            az storage account update \
+              --name $STORAGE_ACCOUNT \
+              --resource-group $RESOURCE_GROUP \
+              --public-network-access Enabled \
+              --default-action Allow
+            
+            echo "✓ Public access enabled for Terraform operations"
+            
+            # Wait for the change to propagate
+            echo "Waiting for changes to propagate..."
+            sleep 10
+          else
+            echo "Public access is already enabled. No changes needed."
+          fi
+          
+        elif [ "$ACTION" == "disable" ]; then
+          echo "Disabling public network access for security..."
+          az storage account update \
+            --name $STORAGE_ACCOUNT \
+            --resource-group $RESOURCE_GROUP \
+            --public-network-access Disabled
+          
+          echo "Updating network rules to deny public access..."
+          az storage account update \
+            --name $STORAGE_ACCOUNT \
+            --resource-group $RESOURCE_GROUP \
+            --default-action Deny
+          
+          echo "✓ Storage account public access has been disabled"
+          echo "✓ Storage account is now only accessible via private endpoint"
+          
+          # Verify the changes
+          echo "Verifying security settings..."
+          az storage account show \
+            --name $STORAGE_ACCOUNT \
+            --resource-group $RESOURCE_GROUP \
+            --query "{Name:name, PublicAccess:publicNetworkAccess, DefaultAction:networkRuleSet.defaultAction}" \
+            --output table
+        else
+          echo "Invalid action: $ACTION. Must be 'enable' or 'disable'"
+          exit 1
+        fi
