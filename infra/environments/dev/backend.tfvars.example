@@ -1,0 +1,8 @@
+# Example backend configuration
+# Copy this to backend.tfvars and customize values
+# Use with: terraform init -backend-config="backend.tfvars"
+
+resource_group_name  = "rg-terraform-state"
+storage_account_name = "stateterraformaks"
+container_name       = "tfstate"
+key                  = "aks-assignment.tfstate"
